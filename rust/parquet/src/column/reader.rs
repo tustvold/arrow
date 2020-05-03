@@ -101,12 +101,180 @@ pub fn get_typed_column_reader<T: DataType>(
     })
 }
 
-/// Typed value reader for a particular primitive column.
-pub struct ColumnReaderImpl<T: DataType> {
+/// Handles definition and repetition level decoding exposing a simplified interface for parsing page data
+pub struct RawColumnReader {
     descr: ColumnDescPtr,
     def_level_decoder: Option<LevelDecoder>,
     rep_level_decoder: Option<LevelDecoder>,
-    page_reader: Box<PageReader>,
+    page_reader: Box<dyn PageReader>,
+}
+
+pub enum ColumnPage {
+    Dictionary {
+        buf: ByteBufferPtr,
+        num_values: u32,
+        encoding: Encoding,
+        is_sorted: bool,
+    },
+    Values {
+        buf: ByteBufferPtr,
+        offset: usize,
+        num_values: u32,
+        encoding: Encoding,
+    },
+}
+
+impl RawColumnReader {
+    pub fn new(descr: ColumnDescPtr, page_reader: Box<dyn PageReader>) -> Self {
+        Self {
+            descr,
+            def_level_decoder: None,
+            rep_level_decoder: None,
+            page_reader,
+        }
+    }
+
+    /// Reads a new page and set up the decoders for levels, values or dictionary.
+    /// Returns false if there's no page left.
+    fn read_new_page(&mut self) -> Result<Option<ColumnPage>> {
+        match self.page_reader.get_next_page()? {
+            // No more page to read
+            None => return Ok(None),
+            Some(current_page) => {
+                match current_page {
+                    // 1. Dictionary page: configure dictionary for this page.
+                    Page::DictionaryPage {
+                        buf,
+                        num_values,
+                        encoding,
+                        is_sorted,
+                    } => Ok(Some(ColumnPage::Dictionary {
+                        buf,
+                        num_values,
+                        encoding,
+                        is_sorted,
+                    })),
+                    // 2. Data page v1
+                    Page::DataPage {
+                        buf,
+                        num_values,
+                        encoding,
+                        def_level_encoding,
+                        rep_level_encoding,
+                        statistics: _,
+                    } => {
+                        let mut buffer_ptr = buf;
+
+                        if self.descr.max_rep_level() > 0 {
+                            let mut rep_decoder = LevelDecoder::v1(
+                                rep_level_encoding,
+                                self.descr.max_rep_level(),
+                            );
+                            let total_bytes = rep_decoder
+                                .set_data(num_values as usize, buffer_ptr.all());
+                            buffer_ptr = buffer_ptr.start_from(total_bytes);
+                            self.rep_level_decoder = Some(rep_decoder);
+                        }
+
+                        if self.descr.max_def_level() > 0 {
+                            let mut def_decoder = LevelDecoder::v1(
+                                def_level_encoding,
+                                self.descr.max_def_level(),
+                            );
+                            let total_bytes = def_decoder
+                                .set_data(num_values as usize, buffer_ptr.all());
+                            buffer_ptr = buffer_ptr.start_from(total_bytes);
+                            self.def_level_decoder = Some(def_decoder);
+                        }
+
+                        Ok(Some(ColumnPage::Values {
+                            buf: buffer_ptr,
+                            offset: 0,
+                            num_values,
+                            encoding,
+                        }))
+                    }
+                    // 3. Data page v2
+                    Page::DataPageV2 {
+                        buf,
+                        num_values,
+                        encoding,
+                        num_nulls: _,
+                        num_rows: _,
+                        def_levels_byte_len,
+                        rep_levels_byte_len,
+                        is_compressed: _,
+                        statistics: _,
+                    } => {
+                        let mut offset = 0;
+
+                        // DataPage v2 only supports RLE encoding for repetition
+                        // levels
+                        if self.descr.max_rep_level() > 0 {
+                            let mut rep_decoder =
+                                LevelDecoder::v2(self.descr.max_rep_level());
+                            let bytes_read = rep_decoder.set_data_range(
+                                num_values as usize,
+                                &buf,
+                                offset,
+                                rep_levels_byte_len as usize,
+                            );
+                            offset += bytes_read;
+                            self.rep_level_decoder = Some(rep_decoder);
+                        }
+
+                        // DataPage v2 only supports RLE encoding for definition
+                        // levels
+                        if self.descr.max_def_level() > 0 {
+                            let mut def_decoder =
+                                LevelDecoder::v2(self.descr.max_def_level());
+                            let bytes_read = def_decoder.set_data_range(
+                                num_values as usize,
+                                &buf,
+                                offset,
+                                def_levels_byte_len as usize,
+                            );
+                            offset += bytes_read;
+                            self.def_level_decoder = Some(def_decoder);
+                        }
+
+                        Ok(Some(ColumnPage::Values {
+                            buf,
+                            offset,
+                            num_values,
+                            encoding,
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn read_rep_levels(&mut self, buffer: &mut [i16]) -> Result<usize> {
+        let level_decoder = self
+            .rep_level_decoder
+            .as_mut()
+            .expect("rep_level_decoder be set");
+        level_decoder.get(buffer)
+    }
+
+    #[inline]
+    fn read_def_levels(&mut self, buffer: &mut [i16]) -> Result<usize> {
+        let level_decoder = self
+            .def_level_decoder
+            .as_mut()
+            .expect("def_level_decoder be set");
+        level_decoder.get(buffer)
+    }
+}
+
+/// Typed value reader for a particular primitive column.
+pub struct ColumnReaderImpl<T: DataType> {
+    reader: RawColumnReader,
+
+    descr: ColumnDescPtr,
+
     current_encoding: Option<Encoding>,
 
     // The total number of values stored in the data page.
@@ -117,17 +285,16 @@ pub struct ColumnReaderImpl<T: DataType> {
     num_decoded_values: u32,
 
     // Cache of decoders for existing encodings
-    decoders: HashMap<Encoding, Box<Decoder<T>>>,
+    decoders: HashMap<Encoding, Box<dyn Decoder<T>>>,
 }
 
 impl<T: DataType> ColumnReaderImpl<T> {
     /// Creates new column reader based on column descriptor and page reader.
-    pub fn new(descr: ColumnDescPtr, page_reader: Box<PageReader>) -> Self {
+    pub fn new(descr: ColumnDescPtr, page_reader: Box<dyn PageReader>) -> Self {
+        let reader = RawColumnReader::new(descr.clone(), page_reader);
         Self {
             descr,
-            def_level_decoder: None,
-            rep_level_decoder: None,
-            page_reader,
+            reader,
             current_encoding: None,
             num_buffered_values: 0,
             num_decoded_values: 0,
@@ -210,7 +377,7 @@ impl<T: DataType> ColumnReaderImpl<T> {
             // If the field is required and non-repeated, there are no definition levels
             if self.descr.max_def_level() > 0 && def_levels.as_ref().is_some() {
                 if let Some(ref mut levels) = def_levels {
-                    num_def_levels = self.read_def_levels(
+                    num_def_levels = self.reader.read_def_levels(
                         &mut levels[levels_read..levels_read + iter_batch_size],
                     )?;
                     for i in levels_read..levels_read + num_def_levels {
@@ -228,7 +395,7 @@ impl<T: DataType> ColumnReaderImpl<T> {
 
             if self.descr.max_rep_level() > 0 && rep_levels.is_some() {
                 if let Some(ref mut levels) = rep_levels {
-                    num_rep_levels = self.read_rep_levels(
+                    num_rep_levels = self.reader.read_rep_levels(
                         &mut levels[levels_read..levels_read + iter_batch_size],
                     )?;
 
@@ -267,142 +434,17 @@ impl<T: DataType> ColumnReaderImpl<T> {
         Ok((values_read, levels_read))
     }
 
-    /// Reads a new page and set up the decoders for levels, values or dictionary.
-    /// Returns false if there's no page left.
-    fn read_new_page(&mut self) -> Result<bool> {
-        #[allow(while_true)]
-        while true {
-            match self.page_reader.get_next_page()? {
-                // No more page to read
-                None => return Ok(false),
-                Some(current_page) => {
-                    match current_page {
-                        // 1. Dictionary page: configure dictionary for this page.
-                        p @ Page::DictionaryPage { .. } => {
-                            self.configure_dictionary(p)?;
-                            continue;
-                        }
-                        // 2. Data page v1
-                        Page::DataPage {
-                            buf,
-                            num_values,
-                            encoding,
-                            def_level_encoding,
-                            rep_level_encoding,
-                            statistics: _,
-                        } => {
-                            self.num_buffered_values = num_values;
-                            self.num_decoded_values = 0;
-
-                            let mut buffer_ptr = buf;
-
-                            if self.descr.max_rep_level() > 0 {
-                                let mut rep_decoder = LevelDecoder::v1(
-                                    rep_level_encoding,
-                                    self.descr.max_rep_level(),
-                                );
-                                let total_bytes = rep_decoder.set_data(
-                                    self.num_buffered_values as usize,
-                                    buffer_ptr.all(),
-                                );
-                                buffer_ptr = buffer_ptr.start_from(total_bytes);
-                                self.rep_level_decoder = Some(rep_decoder);
-                            }
-
-                            if self.descr.max_def_level() > 0 {
-                                let mut def_decoder = LevelDecoder::v1(
-                                    def_level_encoding,
-                                    self.descr.max_def_level(),
-                                );
-                                let total_bytes = def_decoder.set_data(
-                                    self.num_buffered_values as usize,
-                                    buffer_ptr.all(),
-                                );
-                                buffer_ptr = buffer_ptr.start_from(total_bytes);
-                                self.def_level_decoder = Some(def_decoder);
-                            }
-
-                            // Data page v1 does not have offset, all content of buffer
-                            // should be passed
-                            self.set_current_page_encoding(
-                                encoding,
-                                &buffer_ptr,
-                                0,
-                                num_values as usize,
-                            )?;
-                            return Ok(true);
-                        }
-                        // 3. Data page v2
-                        Page::DataPageV2 {
-                            buf,
-                            num_values,
-                            encoding,
-                            num_nulls: _,
-                            num_rows: _,
-                            def_levels_byte_len,
-                            rep_levels_byte_len,
-                            is_compressed: _,
-                            statistics: _,
-                        } => {
-                            self.num_buffered_values = num_values;
-                            self.num_decoded_values = 0;
-
-                            let mut offset = 0;
-
-                            // DataPage v2 only supports RLE encoding for repetition
-                            // levels
-                            if self.descr.max_rep_level() > 0 {
-                                let mut rep_decoder =
-                                    LevelDecoder::v2(self.descr.max_rep_level());
-                                let bytes_read = rep_decoder.set_data_range(
-                                    self.num_buffered_values as usize,
-                                    &buf,
-                                    offset,
-                                    rep_levels_byte_len as usize,
-                                );
-                                offset += bytes_read;
-                                self.rep_level_decoder = Some(rep_decoder);
-                            }
-
-                            // DataPage v2 only supports RLE encoding for definition
-                            // levels
-                            if self.descr.max_def_level() > 0 {
-                                let mut def_decoder =
-                                    LevelDecoder::v2(self.descr.max_def_level());
-                                let bytes_read = def_decoder.set_data_range(
-                                    self.num_buffered_values as usize,
-                                    &buf,
-                                    offset,
-                                    def_levels_byte_len as usize,
-                                );
-                                offset += bytes_read;
-                                self.def_level_decoder = Some(def_decoder);
-                            }
-
-                            self.set_current_page_encoding(
-                                encoding,
-                                &buf,
-                                offset,
-                                num_values as usize,
-                            )?;
-                            return Ok(true);
-                        }
-                    };
-                }
-            }
-        }
-
-        Ok(true)
-    }
-
     /// Resolves and updates encoding and set decoder for the current page
     fn set_current_page_encoding(
         &mut self,
         mut encoding: Encoding,
         buffer_ptr: &ByteBufferPtr,
         offset: usize,
-        len: usize,
+        num_values: u32,
     ) -> Result<()> {
+        self.num_buffered_values = num_values;
+        self.num_decoded_values = 0;
+
         if encoding == Encoding::PLAIN_DICTIONARY {
             encoding = Encoding::RLE_DICTIONARY;
         }
@@ -421,7 +463,7 @@ impl<T: DataType> ColumnReaderImpl<T> {
             self.decoders.get_mut(&encoding).unwrap()
         };
 
-        decoder.set_data(buffer_ptr.start_from(offset), len as usize)?;
+        decoder.set_data(buffer_ptr.start_from(offset), num_values as usize)?;
         self.current_encoding = Some(encoding);
         Ok(())
     }
@@ -431,34 +473,33 @@ impl<T: DataType> ColumnReaderImpl<T> {
         if self.num_buffered_values == 0
             || self.num_buffered_values == self.num_decoded_values
         {
-            // TODO: should we return false if read_new_page() = true and
-            // num_buffered_values = 0?
-            if !self.read_new_page()? {
-                Ok(false)
-            } else {
-                Ok(self.num_buffered_values != 0)
+            loop {
+                match self.reader.read_new_page()? {
+                    Some(ColumnPage::Dictionary {
+                        buf,
+                        num_values,
+                        encoding,
+                        is_sorted: _,
+                    }) => {
+                        self.configure_dictionary(encoding, buf, num_values)?;
+                    }
+                    Some(ColumnPage::Values {
+                        buf,
+                        offset,
+                        num_values,
+                        encoding,
+                    }) => {
+                        self.set_current_page_encoding(
+                            encoding, &buf, offset, num_values,
+                        )?;
+                        return Ok(self.num_buffered_values != 0);
+                    }
+                    None => return Ok(false),
+                }
             }
         } else {
             Ok(true)
         }
-    }
-
-    #[inline]
-    fn read_rep_levels(&mut self, buffer: &mut [i16]) -> Result<usize> {
-        let level_decoder = self
-            .rep_level_decoder
-            .as_mut()
-            .expect("rep_level_decoder be set");
-        level_decoder.get(buffer)
-    }
-
-    #[inline]
-    fn read_def_levels(&mut self, buffer: &mut [i16]) -> Result<usize> {
-        let level_decoder = self
-            .def_level_decoder
-            .as_mut()
-            .expect("def_level_decoder be set");
-        level_decoder.get(buffer)
     }
 
     #[inline]
@@ -474,31 +515,35 @@ impl<T: DataType> ColumnReaderImpl<T> {
     }
 
     #[inline]
-    fn configure_dictionary(&mut self, page: Page) -> Result<bool> {
-        let mut encoding = page.encoding();
-        if encoding == Encoding::PLAIN || encoding == Encoding::PLAIN_DICTIONARY {
-            encoding = Encoding::RLE_DICTIONARY
+    fn configure_dictionary(
+        &mut self,
+        encoding: Encoding,
+        buf: ByteBufferPtr,
+        num_values: u32,
+    ) -> Result<()> {
+        if encoding != Encoding::PLAIN
+            && encoding != Encoding::PLAIN_DICTIONARY
+            && encoding != Encoding::RLE_DICTIONARY
+        {
+            return Err(nyi_err!(
+                "Invalid/Unsupported encoding type for dictionary: {}",
+                encoding
+            ));
         }
 
-        if self.decoders.contains_key(&encoding) {
+        if self.decoders.contains_key(&Encoding::RLE_DICTIONARY) {
             return Err(general_err!("Column cannot have more than one dictionary"));
         }
 
-        if encoding == Encoding::RLE_DICTIONARY {
-            let mut dictionary = PlainDecoder::<T>::new(self.descr.type_length());
-            let num_values = page.num_values();
-            dictionary.set_data(page.buffer().clone(), num_values as usize)?;
+        let mut dictionary = PlainDecoder::<T>::new(self.descr.type_length());
+        dictionary.set_data(buf, num_values as usize)?;
 
-            let mut decoder = DictDecoder::new();
-            decoder.set_dict(Box::new(dictionary))?;
-            self.decoders.insert(encoding, Box::new(decoder));
-            Ok(true)
-        } else {
-            Err(nyi_err!(
-                "Invalid/Unsupported encoding type for dictionary: {}",
-                encoding
-            ))
-        }
+        let mut decoder = DictDecoder::new();
+        decoder.set_dict(Box::new(dictionary))?;
+        self.decoders
+            .insert(Encoding::RLE_DICTIONARY, Box::new(decoder));
+
+        Ok(())
     }
 }
 
